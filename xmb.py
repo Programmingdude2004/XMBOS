@@ -117,14 +117,39 @@ def synth(notes, dur=0.07, vol=0.25):
             buf.append(int(math.sin(2 * math.pi * f * i / RATE) * (1 - i / n) ** 2 * vol * 32767))
     return pygame.mixer.Sound(buffer=buf.tobytes())
 
+def chord(freqs, dur, vol=0.5):
+    buf = array.array("h")
+    n = int(RATE * dur)
+    for i in range(n):
+        env = min(1.0, i / (0.08 * n)) * (1 - i / n) ** 1.5
+        v = sum(math.sin(2 * math.pi * f * i / RATE) for f in freqs) / len(freqs)
+        buf.append(int(v * env * vol * 32767))
+    return pygame.mixer.Sound(buffer=buf.tobytes())
+
 SND = {}
-try:
-    pygame.mixer.init(RATE, -16, 1, 512)
+for drv in (None, "pipewire", "pulseaudio", "alsa"):  # try the default, then fall back
+    try:
+        if drv:
+            os.environ["SDL_AUDIODRIVER"] = drv
+        pygame.mixer.quit()
+        pygame.mixer.init(RATE, -16, 1, 512)
+        break
+    except Exception:
+        continue
+if pygame.mixer.get_init():
     SND = {"move": synth([880], 0.04, 0.15), "cat": synth([660, 990], 0.05, 0.18),
            "ok": synth([660, 880, 1320]), "back": synth([660, 440], 0.06),
-           "launch": synth([440, 660, 880, 1320], 0.09)}
-except Exception:
-    pass
+           "launch": synth([440, 660, 880, 1320], 0.09),
+           "boot": chord([261.6, 329.6, 392.0, 523.3], 2.8, 0.6),
+           "gameboot": chord([392.0, 587.3, 784.0], 1.1, 0.5)}
+    # drop your own sounds in ~/.config/xmb/sounds/<name>.wav to replace any of these
+    for name in list(SND):
+        wav = os.path.expanduser(f"~/.config/xmb/sounds/{name}.wav")
+        if os.path.exists(wav):
+            try:
+                SND[name] = pygame.mixer.Sound(wav)
+            except Exception:
+                pass
 
 def snd(name):
     s = SND.get(name)
@@ -170,6 +195,7 @@ W, H = screen.get_size()
 S = H / 720  # UI scale
 font = lambda n: pygame.font.SysFont("notosans,dejavusans,arial", int(n * S))
 F_CAT, F_ITEM, F_CLK, F_ICO, F_SM, F_BIG = font(22), font(26), font(24), font(30), font(20), font(40)
+F_HUGE = font(84)
 
 # background gradient, hue follows the month like the PS3 XMB
 hue = (time.localtime().tm_mon - 1) / 12
@@ -267,6 +293,9 @@ def move(dx, dy):
 def run(cmd):
     if cmd == "@quit":
         pygame.quit(); sys.exit()
+    if cmd == "@desktop":  # the login script starts Plasma when this flag exists
+        open(os.path.expanduser("~/.xmb-desktop"), "w").close()
+        pygame.quit(); sys.exit()
     # let the launched app own the controller, then take it back
     for c in list(pads.values()):
         try:
@@ -295,7 +324,7 @@ def confirm():
         elif it.get("confirm"):
             mode, ov = "confirm", it; snd("ok")
         elif "cmd" in it:
-            snd("launch"); run(it["cmd"])
+            gameboot(it["name"]); run(it["cmd"])
 
 def cancel():
     """B / Esc / Backspace"""
@@ -331,11 +360,55 @@ def overlay():
             y += text(ln, F_SM, (box.left + pad, y), 210, "topleft").height + 4 * S
         text("A  Open in browser        B  Back", F_CLK, (box.centerx, box.bottom - 36 * S), 230, "center")
 
+# ---------------------------------------------------------------- coldboot / gameboot
+def skippable():
+    for e in pygame.event.get():
+        if e.type in (pygame.KEYDOWN, pygame.CONTROLLERBUTTONDOWN, pygame.MOUSEBUTTONDOWN):
+            return True
+    return False
+
+def coldboot():
+    """Startup animation: waves fade in from black, logo, chime. Any button skips."""
+    snd("boot")
+    t0 = time.time()
+    black = pygame.Surface((W, H))
+    while True:
+        el = time.time() - t0
+        if el > 3.4 or skippable():
+            break
+        waves(el)
+        a = min(1.0, el / 1.2) * (1.0 if el < 2.5 else max(0.0, (3.4 - el) / 0.9))
+        text("XMBOS", F_HUGE, (W / 2, H * 0.45), 255 * a, "center")
+        black.set_alpha(int(255 * max(0.0, 1 - el / 0.8)))
+        screen.blit(black, (0, 0))
+        pygame.display.flip()
+        clock.tick(60)
+    if pygame.mixer.get_init():
+        pygame.mixer.stop()
+    pygame.event.clear()
+
+def gameboot(name):
+    """Short transition when launching a game or app."""
+    snd("gameboot")
+    t0 = time.time()
+    black = pygame.Surface((W, H))
+    while time.time() - t0 < 1.1:
+        el = time.time() - t0
+        waves(t + el)
+        text(fit(name, F_BIG, W * 0.8), F_BIG, (W / 2, H / 2), 255 * min(1.0, el / 0.4), "center")
+        black.set_alpha(int(255 * min(1.0, max(0.0, (el - 0.5) / 0.6))))
+        screen.blit(black, (0, 0))
+        pygame.display.flip()
+        pygame.event.pump()
+        clock.tick(60)
+
 # ---------------------------------------------------------------- main loop
 threading.Thread(target=feed_loop, daemon=True).start()
 last_dir, hold = (0, 0), 0.0
 clock = pygame.time.Clock()
 t = 0.0
+if "--no-boot" not in sys.argv:
+    coldboot()
 while True:
     dt = clock.tick(60) / 1000
     t += dt

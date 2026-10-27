@@ -6,9 +6,12 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 [[ -f $HERE/xmb.py ]] || { echo "xmb.py must be next to this script."; exit 1; }
 
-PKGS=(cage python-pygame foot noto-fonts retroarch libretro-core-info mpv
+PKGS=(sway python-pygame foot noto-fonts retroarch libretro-core-info mpv
       networkmanager pipewire pipewire-pulse wireplumber mesa vulkan-icd-loader
-      vulkan-radeon vulkan-intel sudo firefox)
+      vulkan-radeon vulkan-intel sudo firefox
+      alsa-utils alsa-ucm-conf alsa-firmware sof-firmware pipewire-alsa bluez bluez-utils
+      plasma-desktop plasma-pa plasma-nm powerdevil kscreen bluedevil dolphin konsole breeze
+      xdg-desktop-portal-kde pacman-contrib)
 
 if [[ ! -d /usr/share/archiso/configs/releng ]]; then
   . /etc/os-release 2>/dev/null || true
@@ -37,6 +40,9 @@ file_permissions+=(
   ["/etc/sudoers.d/xmb"]="0:0:440"
   ["/usr/local/bin/xmb-persist-mount"]="0:0:755"
   ["/usr/local/bin/xmb-make-persist"]="0:0:755"
+  ["/usr/local/bin/xmb-update"]="0:0:755"
+  ["/usr/local/bin/xmb-session"]="0:0:755"
+  ["/etc/skel/Desktop/return-to-xmb.desktop"]="0:0:755"
 )
 EOF
 
@@ -124,7 +130,15 @@ MKEOF
 cat > "$A/etc/skel/.bash_profile" <<'EOF'
 if [[ -z ${WAYLAND_DISPLAY:-} && ${XDG_VTNR:-0} -eq 1 ]]; then
   export SDL_VIDEODRIVER=wayland WLR_RENDERER_ALLOW_SOFTWARE=1 BROWSER=firefox XMB_BROWSER=firefox
-  exec cage -s -- python3 /opt/xmb/xmb.py
+  if [[ -e ~/.xmb-desktop ]]; then            # "Desktop Mode" in the XMB sets this flag
+    rm -f ~/.xmb-desktop
+    exec dbus-run-session -- startplasma-wayland
+  fi
+  for i in $(seq 20); do wpctl status >/dev/null 2>&1 && break; sleep 0.5; done   # wait for PipeWire
+  for c in 0 1 2 3; do for ctl in Master Speaker Headphone; do amixer -c $c -q sset $ctl unmute 2>/dev/null; done; done
+  wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null
+  wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.7 2>/dev/null
+  exec sway -c /etc/xmb/sway.conf
 fi
 EOF
 
@@ -133,6 +147,8 @@ cat > "$A/etc/skel/.config/xmb/config.json" <<'EOF'
   {"name": "Settings", "items": [
     {"name": "Install to Disk", "cmd": "foot bash -c 'xmb-install; read -rp \"Press Enter\" _'"},
     {"name": "Enable Persistence", "cmd": "foot bash -c 'xmb-make-persist; read -rp \"Press Enter\" _'"},
+    {"name": "Desktop Mode", "cmd": "@desktop", "confirm": true},
+    {"name": "System Update", "cmd": "foot bash -c 'xmb-update; read -rp \"Press Enter\" _'"},
     {"name": "Wi-Fi", "cmd": "foot nmtui"},
     {"name": "Terminal", "cmd": "foot"},
     {"name": "Reboot", "cmd": "systemctl reboot", "confirm": true},
@@ -142,12 +158,83 @@ cat > "$A/etc/skel/.config/xmb/config.json" <<'EOF'
   {"name": "Media", "items": [
     {"name": "Videos", "cmd": "mpv --fs ~/Videos"},
     {"name": "Music", "cmd": "mpv --no-video ~/Music"}]},
+  {"name": "Network", "items": [
+    {"name": "Web Browser", "cmd": "firefox"}]},
   {"name": "News", "feeds": [
     "https://hnrss.org/frontpage",
     "https://hackaday.com/blog/feed/",
     "https://feeds.bbci.co.uk/news/rss.xml"]}
 ]
 EOF
+
+# --- audio services for the live user (PipeWire sockets, Bluetooth) --------------------
+mkdir -p "$A/etc/systemd/user/sockets.target.wants" "$A/etc/systemd/user/pipewire.service.wants" \
+         "$A/etc/skel/Desktop" "$A/etc/xmb"
+ln -sf /usr/lib/systemd/user/pipewire.socket "$A/etc/systemd/user/sockets.target.wants/pipewire.socket"
+ln -sf /usr/lib/systemd/user/pipewire-pulse.socket "$A/etc/systemd/user/sockets.target.wants/pipewire-pulse.socket"
+ln -sf /usr/lib/systemd/user/wireplumber.service "$A/etc/systemd/user/pipewire.service.wants/wireplumber.service"
+ln -sf /usr/lib/systemd/system/bluetooth.service "$A/etc/systemd/system/multi-user.target.wants/bluetooth.service"
+
+# --- Desktop Mode (KDE Plasma): shortcut that goes back to the XMB ----------------------
+cat > "$A/etc/skel/Desktop/return-to-xmb.desktop" <<'DKEOF'
+[Desktop Entry]
+Type=Application
+Name=Return to XMB
+Exec=sh -c 'loginctl terminate-session "$XDG_SESSION_ID"'
+Icon=system-log-out
+Terminal=false
+DKEOF
+
+# --- OS updates: pacman full upgrade + XMB self-update from the repo that built this ISO ---
+printf 'XMB_URL=%s\n' "${XMB_UPDATE_URL:-}" > "$A/etc/xmb/update.conf"
+
+# --- kiosk compositor: sway, so portrait-native panels (Steam Deck) can be rotated to landscape ---
+cat > "$A/etc/xmb/sway.conf" <<'SWEOF'
+default_border none
+for_window [app_id=".*"] fullscreen enable
+for_window [class=".*"] fullscreen enable
+exec /usr/local/bin/xmb-session
+SWEOF
+cat > "$A/usr/local/bin/xmb-session" <<'XSEOF'
+#!/usr/bin/env bash
+# Runs inside sway: rotate portrait-native panels to landscape, start the XMB, then end the session.
+python3 - <<'PY'
+import json, subprocess
+outs = json.loads(subprocess.check_output(["swaymsg", "-t", "get_outputs", "-r"]))
+for o in outs:
+    m = o.get("current_mode") or {}
+    if m.get("height", 0) > m.get("width", 0) and o.get("transform") == "normal":
+        subprocess.run(["swaymsg", "output", o["name"], "transform", "90"])
+PY
+python3 /opt/xmb/xmb.py
+swaymsg exit
+XSEOF
+cat > "$A/usr/local/bin/xmb-update" <<'UPEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+[[ $EUID -eq 0 ]] || exec sudo "$0" "$@"
+if [[ -d /run/archiso ]]; then
+  echo "You're on the live USB, so updates would be lost on reboot."
+  echo "Install to disk first, or rebuild the ISO to get a newer version."
+  exit 0
+fi
+echo "== Updating system packages =="
+pacman -Syu || { echo "Package update failed or was cancelled."; exit 1; }
+[[ -f /etc/xmb/update.conf ]] && . /etc/xmb/update.conf
+if [[ -n ${XMB_URL:-} ]]; then
+  echo "== Updating XMB =="
+  tmp=$(mktemp --suffix=.py)
+  if curl -fsSL "$XMB_URL" -o "$tmp" && python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$tmp"; then
+    cp /opt/xmb/xmb.py /opt/xmb/xmb.py.bak
+    install -m644 "$tmp" /opt/xmb/xmb.py && echo "XMB updated (backup: xmb.py.bak)."
+  else
+    echo "XMB update skipped (download or check failed)."
+  fi
+fi
+read -rp "Reboot now? [y/N] " r
+[[ $r =~ ^[Yy] ]] && systemctl reboot
+exit 0
+UPEOF
 
 # --- installer (UEFI, wipes a whole disk, systemd-boot) ------------------
 cat > "$A/usr/local/bin/xmb-install" <<'INSTALLER'
@@ -188,13 +275,16 @@ echo LANG=en_US.UTF-8 > /etc/locale.conf
 echo "$H" > /etc/hostname
 useradd -m -G wheel,video,input,audio,render -s /bin/bash "$U"
 echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
-systemctl enable NetworkManager
+systemctl enable NetworkManager bluetooth systemd-boot-update
+systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service
 bootctl install
 CH
 printf '%s:%s\n' "$U" "$PW" | arch-chroot /mnt chpasswd
 
 # XMB session for the new user
 cp -a /opt/xmb /mnt/opt/
+cp /usr/local/bin/xmb-update /usr/local/bin/xmb-session /mnt/usr/local/bin/
+mkdir -p /mnt/etc/xmb; cp /etc/xmb/update.conf /etc/xmb/sway.conf /mnt/etc/xmb/
 cp -a /etc/skel/. "/mnt/home/$U/"
 python3 - "/mnt/home/$U/.config/xmb/config.json" <<'PY'
 import json, sys

@@ -1,0 +1,25 @@
+# Put this file at .github/workflows/build-iso.yml in a GitHub repo that also
+# contains xmb.py and build-xmbos.sh. Run it from the Actions tab, then
+# download the "xmbos-iso" artifact.
+name: Build XMBOS ISO
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm archiso git
+      - uses: actions/checkout@v4
+      - name: Build ISO
+        run: bash build-xmbos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xmbos-iso
+          path: out/*.iso
+          if-no-files-found: error
